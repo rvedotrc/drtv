@@ -1,0 +1,178 @@
+#!/usr/bin/env ruby
+# vi: set ts=2 sw=2 :
+
+require 'json'
+require 'rest-client'
+require 'shellwords'
+
+class HLSOutput
+  attr_accessor :id, :types, :uri, :programs,
+    :duration, :start, :bitrate
+  def initialize
+    @types = []
+    @programs = []
+  end
+end
+
+class HLSProgram
+  attr_accessor :id, :metadata, :streams
+  def initialize
+    @metadata = {}
+    @streams = []
+  end
+end
+
+class HLSStream
+  attr_accessor :id, :type, :codec, :info, :metadata
+  def initialize
+    @metadata = {}
+  end
+end
+
+class DRTVGrabber
+
+  def mirror(url, local_file)
+    if File.exist?(local_file)
+      IO.read local_file
+    else
+      content = RestClient.get(url)
+      IO.write(local_file, content)
+      puts "Saved #{local_file}"
+      content
+    end
+  end
+
+  def list_hls(uri)
+    log = `ffmpeg -i #{Shellwords.shellescape uri} 2>&1`
+    
+    outputs = []
+    current_metadata = nil
+
+    log.each_line do |l|
+      l.chomp
+      l.sub! /\s+$/, ""
+      # puts "?? >>#{l}<<"
+
+      case l
+      when /^Input #(\d+), (hls,applehttp), from '(.*)':$/
+        o = HLSOutput.new
+        o.id = $1
+        o.types = $2.split ','
+        o.uri = $3
+        outputs << o
+      when /^  Duration: (.*?), start: (.*?), bitrate: (.*) kb\/s$/
+        outputs.last.duration = $1
+        outputs.last.start = $2
+        outputs.last.bitrate = $3
+      when /^  Program (\d+)$/
+        pr = HLSProgram.new
+        pr.id = $1
+        outputs.last.programs << pr
+        current_metadata = pr.metadata
+      when /^    Metadata:/
+      when /^      (\w+) : (.*)$/
+        current_metadata[$1] = $2
+      when /^    Stream #(\d+:\d+): (\w+): (\w+) (.*)$/
+        s = HLSStream.new
+        s.id = $1
+        s.type = $2
+        s.codec = $3
+        s.info = $4
+        outputs.last.programs.last.streams << s
+        current_metadata = s.metadata
+      when /^At least one output file must be specified$/
+      else
+        puts "Ignoring #{l.inspect}" unless outputs.empty?
+      end
+    end
+
+    outputs
+  end
+
+  def save_hls(uri, local_file)
+    if !File.exist? local_file
+      puts "Save HLS to #{local_file}" 
+
+      outputs = list_hls(uri)
+      p outputs
+
+      # Copy all streams from whichever program has the highest-bitrate video
+      # stream.
+      program = outputs.first.programs.max do |pr|
+        pr.streams.find do |s|
+          s.type == "Video"
+        end.metadata["variant_bitrate"].to_i
+      end
+      p program
+
+      tmp = File.join(File.dirname(local_file), "tmp." + File.basename(local_file))
+
+      cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-y",
+        "-i", uri,
+        "-acodec", "copy",
+        "-vcodec", "copy",
+        *(program.streams.map do |s|
+          [ "-map", s.id ]
+        end.flatten),
+        tmp,
+      ]
+
+      p cmd
+
+      system *cmd
+      unless $?.success?
+        raise "ffmpeg failed"
+      end
+      File.rename tmp, local_file
+    end
+  end
+
+	def run(slug)
+    data = JSON.parse(mirror(
+      "https://www.dr.dk/mu-online/api/1.4/programcard/#{slug}?expanded=true",
+      "#{slug}.json",
+    ))
+
+    # Video
+    if primary = data["PrimaryAsset"]
+      if !primary["Downloadable"]
+        if primary["Kind"] == "VideoResource" and !primary["Encrypted"]
+          if hls = primary["Links"].find {|l| l["Target"] == "HLS"}
+            save_hls(hls["Uri"], "#{slug}.#{hls["FileFormat"]}")
+          else
+            puts "Skipped"
+          end
+        else
+          puts "Skipped #{primary.inspect}"
+        end
+      else
+        raise "TODO, it's downloadable"
+      end
+    end
+
+    # Image
+    mirror(data["PrimaryImageUri"], "#{slug}.jpg")
+
+    # Subtitles
+    subs = data["PrimaryAsset"]["Subtitleslist"]
+    if subs
+      subs.each do |asset|
+        if asset["MimeType"] == "text/vtt;charset=utf-8"
+          mirror(asset["Uri"], "#{slug}.#{asset["Language"]}.#{asset["Type"]}.vtt")
+        else
+          puts "Ignoring subtitles #{asset.inspect}"
+        end
+      end
+    end
+	end
+
+end
+
+ARGV.each do |slug|
+  DRTVGrabber.new.run(slug)
+end
+
+# eof drtv-grabber
